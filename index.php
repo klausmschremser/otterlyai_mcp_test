@@ -27,7 +27,8 @@
 ini_set('memory_limit',       '256M');
 ini_set('max_execution_time', '300');
 
-define('DATA_DIR', __DIR__ . '/../../data');
+define('DATA_DIR', __DIR__ . '/data');
+//define('DATA_DIR', __DIR__ . '/../../data');
 
 define('ENGINE_FILES', [
     'chatgpt'      => 'ChatGPT',
