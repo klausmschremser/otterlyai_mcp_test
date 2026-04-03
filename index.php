@@ -27,8 +27,7 @@
 ini_set('memory_limit',       '256M');
 ini_set('max_execution_time', '300');
 
-define('DATA_DIR', __DIR__ . '/data');
-//define('DATA_DIR', __DIR__ . '/../../data');
+define('DATA_DIR', __DIR__ . '/../../data');
 
 define('ENGINE_FILES', [
     'chatgpt'      => 'ChatGPT',
@@ -38,6 +37,73 @@ define('ENGINE_FILES', [
     'googleaimode' => 'Google AI Mode',
     'gemini'       => 'Google Gemini',
 ]);
+
+define('LOG_DB_PATH', DATA_DIR . '/mcp_log.db');
+
+// ── Logging ───────────────────────────────────────────────────────────────────
+
+/**
+ * Session ID: derived from IP + User-Agent + hour-bucket.
+ * Same client within the same clock-hour gets the same session_id,
+ * so you can count how many tool calls one Claude conversation made.
+ */
+function get_session_id(): string {
+    $ip  = $_SERVER['HTTP_X_FORWARDED_FOR']
+        ?? $_SERVER['HTTP_X_REAL_IP']
+        ?? $_SERVER['REMOTE_ADDR']
+        ?? 'unknown';
+    // Take only the first IP if comma-separated (proxy chain)
+    $ip  = trim(explode(',', $ip)[0]);
+    $ua  = $_SERVER['HTTP_USER_AGENT'] ?? 'unknown';
+    $hour = date('YmdH');
+    return substr(md5("$ip|$ua|$hour"), 0, 16);
+}
+
+function get_log_db(): PDO {
+    $db = new PDO('sqlite:' . LOG_DB_PATH);
+    $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $db->exec("PRAGMA journal_mode = WAL");  // WAL allows concurrent reads+writes
+    $db->exec("PRAGMA synchronous  = NORMAL");
+    $db->exec("CREATE TABLE IF NOT EXISTS requests (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts           TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        session_id   TEXT    NOT NULL,
+        u_id         TEXT    NOT NULL,
+        method       TEXT    NOT NULL,
+        tool_name    TEXT,
+        duration_ms  INTEGER,
+        status       TEXT    DEFAULT 'ok',
+        ip           TEXT,
+        user_agent   TEXT
+    )");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_session  ON requests(session_id)");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_ts       ON requests(ts)");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_u_id     ON requests(u_id)");
+    return $db;
+}
+
+function log_request(string $u_id, string $method, ?string $tool_name, int $duration_ms, string $status = 'ok'): void {
+    try {
+        $db = get_log_db();
+        $ip = trim(explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']
+            ?? $_SERVER['HTTP_X_REAL_IP']
+            ?? $_SERVER['REMOTE_ADDR'] ?? 'unknown')[0]);
+        $db->prepare("INSERT INTO requests (session_id, u_id, method, tool_name, duration_ms, status, ip, user_agent)
+                      VALUES (:sid, :uid, :method, :tool, :dur, :status, :ip, :ua)")
+           ->execute([
+               ':sid'    => get_session_id(),
+               ':uid'    => $u_id,
+               ':method' => $method,
+               ':tool'   => $tool_name,
+               ':dur'    => $duration_ms,
+               ':status' => $status,
+               ':ip'     => $ip,
+               ':ua'     => substr($_SERVER['HTTP_USER_AGENT'] ?? 'unknown', 0, 200),
+           ]);
+    } catch (\Throwable $e) {
+        // Logging must never break the MCP response — silently swallow errors
+    }
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -520,12 +586,16 @@ function execute_tool(string $name, array $args, string $u_id): string {
 // ── Handle one JSON-RPC request ───────────────────────────────────────────────
 
 function handle_jsonrpc(array $req, string $u_id): ?array {
-    $id     = $req['id']     ?? null;
-    $method = $req['method'] ?? '';
+    $t0        = microtime(true);
+    $id        = $req['id']     ?? null;
+    $method    = $req['method'] ?? '';
+    $tool_name = ($method === 'tools/call') ? ($req['params']['name'] ?? null) : null;
+    $status    = 'ok';
+    $result    = null;
 
     switch ($method) {
         case 'initialize':
-            return [
+            $result = [
                 'jsonrpc' => '2.0', 'id' => $id,
                 'result'  => [
                     'protocolVersion' => '2024-11-05',
@@ -533,15 +603,19 @@ function handle_jsonrpc(array $req, string $u_id): ?array {
                     'serverInfo'      => ['name' => 'otterly-mcp', 'version' => '1.0.0'],
                 ],
             ];
+            break;
 
         case 'notifications/initialized':
+            // No log for silent notifications
             return null;
 
         case 'ping':
-            return ['jsonrpc' => '2.0', 'id' => $id, 'result' => []];
+            $result = ['jsonrpc' => '2.0', 'id' => $id, 'result' => []];
+            break;
 
         case 'tools/list':
-            return ['jsonrpc' => '2.0', 'id' => $id, 'result' => ['tools' => get_tools()]];
+            $result = ['jsonrpc' => '2.0', 'id' => $id, 'result' => ['tools' => get_tools()]];
+            break;
 
         case 'tools/call':
             $content = execute_tool(
@@ -549,17 +623,24 @@ function handle_jsonrpc(array $req, string $u_id): ?array {
                 $req['params']['arguments'] ?? [],
                 $u_id
             );
-            return [
+            $result = [
                 'jsonrpc' => '2.0', 'id' => $id,
                 'result'  => ['content' => [['type' => 'text', 'text' => $content]]],
             ];
+            break;
 
         default:
-            return [
+            $status = 'unknown_method';
+            $result = [
                 'jsonrpc' => '2.0', 'id' => $id,
                 'error'   => ['code' => -32601, 'message' => "Method not found: $method"],
             ];
     }
+
+    $duration_ms = (int)round((microtime(true) - $t0) * 1000);
+    log_request($u_id, $method, $tool_name, $duration_ms, $status);
+
+    return $result;
 }
 
 // ── Validate u_id ─────────────────────────────────────────────────────────────
@@ -600,6 +681,108 @@ if (isset($_GET['debug'])) {
 if (isset($_GET['rebuild_db'])) {
     header('Content-Type: application/json');
     echo json_encode(build_citations_db($u_id), JSON_PRETTY_PRINT);
+    exit;
+}
+
+// ── Logs viewer endpoint ──────────────────────────────────────────────────────
+// ?u_id=1234&logs=1              → recent requests + stats + tool breakdown
+// ?u_id=1234&logs=1&sessions=1   → one row per session (great for "how many calls per conversation")
+// ?u_id=1234&logs=1&all=1        → across all u_ids (admin overview)
+// ?u_id=1234&logs=1&limit=500    → return more rows (default 200, max 1000)
+
+if (isset($_GET['logs'])) {
+    header('Content-Type: application/json');
+    try {
+        $db         = get_log_db();
+        $log_limit  = min((int)($_GET['limit'] ?? 200), 1000);
+        $scope_all  = isset($_GET['all']);
+        $uid_clause = $scope_all ? '' : "AND u_id = " . $db->quote($u_id);
+
+        if (isset($_GET['sessions'])) {
+            // ── Session summary ───────────────────────────────────────────────
+            // Each row = one Claude conversation / MCP session
+            $rows = $db->query("
+                SELECT
+                    session_id,
+                    u_id,
+                    COUNT(*)                                                    AS total_requests,
+                    SUM(CASE WHEN method = 'tools/call' THEN 1 ELSE 0 END)     AS tool_calls,
+                    MIN(ts)                                                     AS first_seen,
+                    MAX(ts)                                                     AS last_seen,
+                    ROUND(AVG(duration_ms))                                     AS avg_duration_ms,
+                    GROUP_CONCAT(DISTINCT CASE WHEN tool_name IS NOT NULL THEN tool_name END) AS tools_used,
+                    ip
+                FROM  requests
+                WHERE 1=1 $uid_clause
+                GROUP BY session_id
+                ORDER BY last_seen DESC
+                LIMIT 100
+            ")->fetchAll(PDO::FETCH_ASSOC);
+
+            echo json_encode([
+                'report'        => 'session_summary',
+                'scope'         => $scope_all ? 'all' : $u_id,
+                'session_count' => count($rows),
+                'note'          => 'session_id is stable per IP+UserAgent within the same clock-hour',
+                'sessions'      => $rows,
+            ], JSON_PRETTY_PRINT);
+
+        } else {
+            // ── Recent requests + stats ───────────────────────────────────────
+            $rows = $db->query("
+                SELECT ts, session_id, u_id, method, tool_name, duration_ms, status, ip
+                FROM   requests
+                WHERE  1=1 $uid_clause
+                ORDER  BY ts DESC
+                LIMIT  $log_limit
+            ")->fetchAll(PDO::FETCH_ASSOC);
+
+            $stats = $db->query("
+                SELECT
+                    COUNT(*)                                                    AS total_requests,
+                    SUM(CASE WHEN method = 'tools/call' THEN 1 ELSE 0 END)     AS tool_calls,
+                    COUNT(DISTINCT session_id)                                  AS unique_sessions,
+                    ROUND(AVG(duration_ms))                                     AS avg_duration_ms,
+                    MIN(ts)                                                     AS oldest,
+                    MAX(ts)                                                     AS newest
+                FROM requests
+                WHERE 1=1 $uid_clause
+            ")->fetch(PDO::FETCH_ASSOC);
+
+            $tools_breakdown = $db->query("
+                SELECT   tool_name,
+                         COUNT(*)               AS calls,
+                         ROUND(AVG(duration_ms)) AS avg_ms,
+                         MIN(duration_ms)        AS min_ms,
+                         MAX(duration_ms)        AS max_ms
+                FROM     requests
+                WHERE    method = 'tools/call' $uid_clause
+                GROUP BY tool_name
+                ORDER BY calls DESC
+            ")->fetchAll(PDO::FETCH_ASSOC);
+
+            // Requests-per-hour heatmap (last 48 h)
+            $hourly = $db->query("
+                SELECT   strftime('%Y-%m-%dT%H:00Z', ts) AS hour,
+                         COUNT(*)                         AS requests
+                FROM     requests
+                WHERE    ts >= datetime('now','-48 hours') $uid_clause
+                GROUP BY hour
+                ORDER BY hour DESC
+            ")->fetchAll(PDO::FETCH_ASSOC);
+
+            echo json_encode([
+                'report'          => 'recent_requests',
+                'scope'           => $scope_all ? 'all' : $u_id,
+                'stats'           => $stats,
+                'tools_breakdown' => $tools_breakdown,
+                'hourly_last_48h' => $hourly,
+                'requests'        => $rows,
+            ], JSON_PRETTY_PRINT);
+        }
+    } catch (\Throwable $e) {
+        echo json_encode(['error' => $e->getMessage()]);
+    }
     exit;
 }
 
