@@ -27,7 +27,10 @@
 ini_set('memory_limit',       '256M');
 ini_set('max_execution_time', '300');
 
-define('DATA_DIR', './data');
+// On Railway (FrankenPHP/Railpack), index.php lives at /app/index.php
+// so __DIR__ = /app  ->  data folder = /app/data
+// Adjust DATA_DIR here if your layout differs.
+define('DATA_DIR', __DIR__ . '/data');
 
 define('ENGINE_FILES', [
     'chatgpt'      => 'ChatGPT',
@@ -826,7 +829,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
 
     $proto    = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
     $host     = $_SERVER['HTTP_HOST'] ?? 'localhost';
-    $path     = strtok($_SERVER['REQUEST_URI'] ?? '/mcp.php', '?');
+    // Strip query string and any trailing /index.php from path
+    // On Railway the app is served at / so the endpoint URL must end in /
+    $path     = strtok($_SERVER['REQUEST_URI'] ?? '/', '?');
+    $path     = preg_replace('#/index\.php$#', '/', $path);
+    $path     = rtrim($path, '/') . '/';
     $endpoint = "$proto://$host{$path}?u_id=$u_id";
 
     echo "event: endpoint\n";
