@@ -30,7 +30,8 @@ ini_set('max_execution_time', '300');
 // On Railway (FrankenPHP/Railpack), index.php lives at /app/index.php
 // so __DIR__ = /app  ->  data folder = /app/data
 // Adjust DATA_DIR here if your layout differs.
-define('DATA_DIR', __DIR__ . '/data');
+//define('DATA_DIR', __DIR__ . '/data');
+define('DATA_DIR', __DIR__ . '/app/../../data/');
 
 define('ENGINE_FILES', [
     'chatgpt'      => 'ChatGPT',
