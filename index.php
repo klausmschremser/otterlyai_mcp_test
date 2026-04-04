@@ -127,15 +127,15 @@ function safe_id(string $id): string {
 }
 
 function data_path(string $u_id, string $engine_key): string {
-    return DATA_DIR . '/' . $u_id . '/' . $engine_key . '_' . $u_id . '.csv';
+    return DATA_DIR . '/' . $u_id . '/' . $engine_key . '.csv';
 }
 
 function citations_csv_path(string $u_id): string {
-    return DATA_DIR . '/' . $u_id . '/citations_' . $u_id . '.csv';
+    return DATA_DIR . '/' . $u_id . '/citations.csv';
 }
 
 function citations_db_path(string $u_id): string {
-    return DATA_DIR . '/' . $u_id . '/citations_' . $u_id . '.db';
+    return DATA_DIR . '/' . $u_id . '/citations.db';
 }
 
 function normalise_headers(array $headers): array {
