@@ -24,14 +24,20 @@
  *   https://yoursite.com/mcp.php?u_id=1234&rebuild_db=1
  */
 
+header("Expires: Tue, 01 Jan 2000 00:00:00 GMT");
+header("Last-Modified: " . gmdate("D, d M Y H:i:s") . " GMT");
+header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+header("Cache-Control: post-check=0, pre-check=0", false);
+header("Pragma: no-cache");
+
 ini_set('memory_limit',       '256M');
 ini_set('max_execution_time', '300');
 
 // On Railway (FrankenPHP/Railpack), index.php lives at /app/index.php
 // so __DIR__ = /app  ->  data folder = /app/data
 // Adjust DATA_DIR here if your layout differs.
-//define('DATA_DIR', __DIR__ . '/data');
-define('DATA_DIR', __DIR__ . '/app/../../data/');
+define('DATA_DIR', __DIR__ . '/data');
+//define('DATA_DIR', __DIR__ . '/app/../../data/');
 
 define('ENGINE_FILES', [
     'chatgpt'      => 'ChatGPT',
