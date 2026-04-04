@@ -15,13 +15,13 @@
  * All subsequent citation queries hit the indexed SQLite file — millisecond responses.
  *
  * Connect Claude via:
- *   https://yoursite.com/mcp.php?u_id=1234
+ *   https://yoursite.com/?u_id=1234
  *
  * Debug:
- *   https://yoursite.com/mcp.php?u_id=1234&debug=1
+ *   https://yoursite.com/?u_id=1234&debug=1
  *
  * Force re-import of citations DB:
- *   https://yoursite.com/mcp.php?u_id=1234&rebuild_db=1
+ *   https://yoursite.com/?u_id=1234&rebuild_db=1
  */
 
 ini_set('memory_limit',       '256M');
