@@ -3,16 +3,16 @@
  * OtterlyAI MCP Server
  *
  * Pre-place files at:
- *   ./data/<u_id>/chatgpt_<u_id>.csv
- *   ./data/<u_id>/googleaio_<u_id>.csv
- *   ./data/<u_id>/perplexity_<u_id>.csv
- *   ./data/<u_id>/mscopilot_<u_id>.csv
- *   ./data/<u_id>/googleaimode_<u_id>.csv
- *   ./data/<u_id>/gemini_<u_id>.csv
- *   ./data/<u_id>/citations_<u_id>.csv
+ *   ./data/<u_id>/chatgpt.csv
+ *   ./data/<u_id>/googleaio.csv
+ *   ./data/<u_id>/perplexity.csv
+ *   ./data/<u_id>/mscopilot.csv
+ *   ./data/<u_id>/googleaimode.csv
+ *   ./data/<u_id>/gemini.csv
+ *   ./data/<u_id>/citations.csv   ← one row per citation event (Prompt,Country,Service,Title,Url,Position,Date,Domain,...)
  *
- * On first use the citations CSV is imported into citations_<u_id>.db (SQLite).
- * All subsequent citation queries hit the indexed SQLite file — millisecond responses.
+ * On first use citations.csv is imported into citations.db (SQLite).
+ * All citation queries hit the indexed SQLite file — millisecond responses.
  *
  * Connect Claude via:
  *   https://yoursite.com/?u_id=1234
@@ -193,7 +193,6 @@ function build_citations_db(string $u_id): array {
         return ['error' => 'Citations CSV not found: ' . $csv_path];
     }
 
-    // Remove existing DB so we start fresh
     if (file_exists($db_path)) unlink($db_path);
 
     $t0 = microtime(true);
@@ -204,35 +203,33 @@ function build_citations_db(string $u_id): array {
     // Performance pragmas — safe for a write-once DB
     $db->exec("PRAGMA journal_mode = OFF");
     $db->exec("PRAGMA synchronous  = OFF");
-    $db->exec("PRAGMA cache_size   = -32000"); // 32 MB cache
+    $db->exec("PRAGMA cache_size   = -32000");
 
+    // New schema: one row = one citation event for one prompt on one date
     $db->exec("CREATE TABLE citations (
-        id                  INTEGER PRIMARY KEY,
-        title               TEXT,
-        url                 TEXT,
-        domain              TEXT,
-        domain_category     TEXT,
-        my_brand_mentioned  TEXT,
-        competitors_mentioned TEXT,
-        cited               INTEGER DEFAULT 0
+        id                    INTEGER PRIMARY KEY,
+        prompt                TEXT,
+        country               TEXT,
+        service               TEXT,    -- ai engine: chatgpt, copilot, perplexity …
+        title                 TEXT,
+        url                   TEXT,
+        position              INTEGER, -- rank in the AI answer (1 = top)
+        date                  TEXT,    -- YYYY-MM-DD
+        domain                TEXT,
+        domain_category       TEXT,
+        my_brand_mentioned    TEXT,
+        competitors_mentioned TEXT
     )");
 
     $fh = fopen($csv_path, 'r');
     $raw_headers = fgetcsv($fh);
-    // Map CSV column names → DB columns
-    $col_map = [
-        'Title'                 => 'title',
-        'Url'                   => 'url',
-        'Domain'                => 'domain',
-        'Domain Category'       => 'domain_category',
-        'My Brand Mentioned'    => 'my_brand_mentioned',
-        'Competitors Mentioned' => 'competitors_mentioned',
-        'Cited'                 => 'cited',
-    ];
 
     $insert = $db->prepare("INSERT INTO citations
-        (title, url, domain, domain_category, my_brand_mentioned, competitors_mentioned, cited)
-        VALUES (:title, :url, :domain, :domain_category, :my_brand_mentioned, :competitors_mentioned, :cited)
+        (prompt, country, service, title, url, position, date, domain,
+         domain_category, my_brand_mentioned, competitors_mentioned)
+        VALUES
+        (:prompt, :country, :service, :title, :url, :position, :date, :domain,
+         :domain_category, :my_brand_mentioned, :competitors_mentioned)
     ");
 
     $count      = 0;
@@ -242,13 +239,17 @@ function build_citations_db(string $u_id): array {
     while (($raw = fgetcsv($fh)) !== false) {
         $row = array_combine($raw_headers, array_pad($raw, count($raw_headers), ''));
         $insert->execute([
+            ':prompt'                 => $row['Prompt']                ?? '',
+            ':country'                => $row['Country']               ?? '',
+            ':service'                => strtolower($row['Service']    ?? ''),
             ':title'                  => $row['Title']                 ?? '',
             ':url'                    => $row['Url']                   ?? '',
+            ':position'               => (int)($row['Position']        ?? 0),
+            ':date'                   => $row['Date']                  ?? '',
             ':domain'                 => $row['Domain']                ?? '',
             ':domain_category'        => $row['Domain Category']       ?? '',
             ':my_brand_mentioned'     => $row['My Brand Mentioned']    ?? '',
             ':competitors_mentioned'  => $row['Competitors Mentioned'] ?? '',
-            ':cited'                  => (int)($row['Cited']           ?? 0),
         ]);
         $count++;
         if ($count % $batch_size === 0) {
@@ -259,11 +260,15 @@ function build_citations_db(string $u_id): array {
     $db->commit();
     fclose($fh);
 
-    // Indexes for every column we filter/sort on
-    $db->exec("CREATE INDEX idx_domain              ON citations(domain)");
-    $db->exec("CREATE INDEX idx_brand_mentioned     ON citations(my_brand_mentioned)");
-    $db->exec("CREATE INDEX idx_cited               ON citations(cited DESC)");
-    $db->exec("CREATE INDEX idx_domain_cited        ON citations(domain, cited DESC)");
+    // Indexes covering every filter/sort/group-by column
+    $db->exec("CREATE INDEX idx_date             ON citations(date)");
+    $db->exec("CREATE INDEX idx_service          ON citations(service)");
+    $db->exec("CREATE INDEX idx_domain           ON citations(domain)");
+    $db->exec("CREATE INDEX idx_brand_mentioned  ON citations(my_brand_mentioned)");
+    $db->exec("CREATE INDEX idx_position         ON citations(position)");
+    $db->exec("CREATE INDEX idx_prompt           ON citations(prompt)");
+    $db->exec("CREATE INDEX idx_service_date     ON citations(service, date)");
+    $db->exec("CREATE INDEX idx_domain_service   ON citations(domain, service)");
 
     $db->exec("ANALYZE");
 
@@ -345,26 +350,62 @@ function get_tools(): array {
         ],
         [
             'name'        => 'top_cited_domains',
-            'description' => 'Top cited domains from the citations index, ranked by total citation count. Fast — uses SQLite.',
+            'description' => 'Top domains appearing in AI citations, ranked by appearance count. Filter by service, date range, or brand mention. Uses SQLite — fast.',
             'inputSchema' => [
                 'type'       => 'object',
                 'properties' => [
                     'n'               => ['type' => 'integer', 'description' => 'How many top domains to return (default 20, max 100)'],
+                    'service'         => ['type' => 'string',  'description' => 'Filter by AI engine, e.g. "chatgpt", "copilot", "perplexity"'],
+                    'date_from'       => ['type' => 'string',  'description' => 'Start date inclusive, format YYYY-MM-DD'],
+                    'date_to'         => ['type' => 'string',  'description' => 'End date inclusive, format YYYY-MM-DD'],
                     'brand_mentioned' => ['type' => 'boolean', 'description' => 'If true, only rows where your brand was mentioned'],
+                    'max_position'    => ['type' => 'integer', 'description' => 'Only include citations at this position or better (e.g. 3 = top 3)'],
                 ],
             ],
         ],
         [
             'name'        => 'search_citations',
-            'description' => 'Search the citations index by domain, URL title keyword, or brand-mention flag. Fast — uses SQLite with indexes.',
+            'description' => 'Search individual citation events by prompt keyword, domain, service, date range, or position. Each row is one citation of one URL for one prompt on one date. Uses SQLite — fast.',
             'inputSchema' => [
                 'type'       => 'object',
                 'properties' => [
-                    'domain'          => ['type' => 'string', 'description' => 'Filter by domain (substring)'],
-                    'title_keyword'   => ['type' => 'string', 'description' => 'Filter by title keyword (substring)'],
+                    'prompt_keyword'  => ['type' => 'string',  'description' => 'Substring match against the Prompt column'],
+                    'domain'          => ['type' => 'string',  'description' => 'Filter by domain (substring)'],
+                    'service'         => ['type' => 'string',  'description' => 'Filter by AI engine, e.g. "chatgpt", "copilot", "perplexity"'],
+                    'date_from'       => ['type' => 'string',  'description' => 'Start date inclusive, format YYYY-MM-DD'],
+                    'date_to'         => ['type' => 'string',  'description' => 'End date inclusive, format YYYY-MM-DD'],
                     'brand_mentioned' => ['type' => 'boolean', 'description' => 'If true, only rows where My Brand Mentioned = Yes'],
+                    'max_position'    => ['type' => 'integer', 'description' => 'Only include citations at this rank or better (e.g. 1 = position 1 only)'],
                     'limit'           => ['type' => 'integer', 'description' => 'Max rows (default 50, max 200)'],
                     'offset'          => ['type' => 'integer', 'description' => 'Pagination offset (default 0)'],
+                ],
+            ],
+        ],
+        [
+            'name'        => 'citations_over_time',
+            'description' => 'Count citation events per day (or per day per service). Great for trend analysis — shows how visibility changes over the tracked period.',
+            'inputSchema' => [
+                'type'       => 'object',
+                'properties' => [
+                    'service'         => ['type' => 'string',  'description' => 'Filter to one AI engine'],
+                    'date_from'       => ['type' => 'string',  'description' => 'Start date YYYY-MM-DD'],
+                    'date_to'         => ['type' => 'string',  'description' => 'End date YYYY-MM-DD'],
+                    'brand_mentioned' => ['type' => 'boolean', 'description' => 'If true, only brand-mentioned rows'],
+                    'group_by_service'=> ['type' => 'boolean', 'description' => 'If true, break down counts per service per day'],
+                ],
+            ],
+        ],
+        [
+            'name'        => 'citations_by_prompt',
+            'description' => 'Which prompts generate the most citations? Groups citation events by prompt text and counts appearances, optionally filtered by service or date.',
+            'inputSchema' => [
+                'type'       => 'object',
+                'properties' => [
+                    'service'         => ['type' => 'string',  'description' => 'Filter by AI engine'],
+                    'date_from'       => ['type' => 'string',  'description' => 'Start date YYYY-MM-DD'],
+                    'date_to'         => ['type' => 'string',  'description' => 'End date YYYY-MM-DD'],
+                    'brand_mentioned' => ['type' => 'boolean', 'description' => 'If true, only brand-mentioned rows'],
+                    'limit'           => ['type' => 'integer', 'description' => 'Top N prompts to return (default 20, max 100)'],
                 ],
             ],
         ],
@@ -489,33 +530,55 @@ function execute_tool(string $name, array $args, string $u_id): string {
             return json_encode(['keyword_filter' => $keyword ?: 'none', 'engines' => array_values($by_engine)], JSON_PRETTY_PRINT);
         }
 
-        // ── top_cited_domains — SQLite ─────────────────────────────────────────
+        // ── top_cited_domains — SQLite ────────────────────────────────────────
         case 'top_cited_domains': {
-            $n          = min((int)($args['n'] ?? 20), 100);
-            $brand_only = !empty($args['brand_mentioned']);
+            $n           = min((int)($args['n'] ?? 20), 100);
+            $brand_only  = !empty($args['brand_mentioned']);
+            $service_f   = strtolower(trim($args['service']   ?? ''));
+            $date_from   = trim($args['date_from']  ?? '');
+            $date_to     = trim($args['date_to']    ?? '');
+            $max_pos     = (int)($args['max_position'] ?? 0);
 
-            $db  = get_citations_db($u_id);
-            $sql = "SELECT domain,
-                           SUM(cited)   AS total_cited,
-                           COUNT(*)     AS appearances
-                    FROM   citations";
+            $db     = get_citations_db($u_id);
+            $where  = [];
             $params = [];
-            if ($brand_only) {
-                $sql .= " WHERE LOWER(my_brand_mentioned) = 'yes'";
-            }
-            $sql .= " GROUP BY domain ORDER BY total_cited DESC LIMIT :n";
-            $params[':n'] = $n;
 
-            $stmt = $db->prepare($sql);
+            if ($service_f)  { $where[] = "service = :service";              $params[':service']   = $service_f; }
+            if ($date_from)  { $where[] = "date >= :date_from";              $params[':date_from'] = $date_from; }
+            if ($date_to)    { $where[] = "date <= :date_to";                $params[':date_to']   = $date_to;   }
+            if ($brand_only) { $where[] = "LOWER(my_brand_mentioned) = 'yes'"; }
+            if ($max_pos > 0){ $where[] = "position <= :max_pos";            $params[':max_pos']   = $max_pos;   }
+
+            $where_sql = $where ? 'WHERE ' . implode(' AND ', $where) : '';
+
+            $params[':n'] = $n;
+            $stmt = $db->prepare("
+                SELECT   domain,
+                         COUNT(*)                     AS appearances,
+                         COUNT(DISTINCT service)       AS services,
+                         COUNT(DISTINCT date)          AS days_seen,
+                         ROUND(AVG(position), 1)       AS avg_position,
+                         MIN(position)                 AS best_position,
+                         MIN(date)                     AS first_seen,
+                         MAX(date)                     AS last_seen
+                FROM     citations $where_sql
+                GROUP BY domain
+                ORDER BY appearances DESC
+                LIMIT    :n
+            ");
             $stmt->execute($params);
             return json_encode($stmt->fetchAll(PDO::FETCH_ASSOC), JSON_PRETTY_PRINT);
         }
 
         // ── search_citations — SQLite ─────────────────────────────────────────
         case 'search_citations': {
-            $domain_f   = trim($args['domain']        ?? '');
-            $title_f    = trim($args['title_keyword'] ?? '');
+            $prompt_f   = trim($args['prompt_keyword'] ?? '');
+            $domain_f   = trim($args['domain']         ?? '');
+            $service_f  = strtolower(trim($args['service'] ?? ''));
+            $date_from  = trim($args['date_from']  ?? '');
+            $date_to    = trim($args['date_to']    ?? '');
             $brand_only = !empty($args['brand_mentioned']);
+            $max_pos    = (int)($args['max_position'] ?? 0);
             $limit      = min((int)($args['limit']  ?? 50), 200);
             $offset     = max((int)($args['offset'] ?? 0),  0);
 
@@ -523,37 +586,114 @@ function execute_tool(string $name, array $args, string $u_id): string {
             $where  = [];
             $params = [];
 
-            if ($domain_f !== '') {
-                $where[]          = "domain LIKE :domain";
-                $params[':domain'] = '%' . $domain_f . '%';
-            }
-            if ($title_f !== '') {
-                $where[]         = "title LIKE :title";
-                $params[':title'] = '%' . $title_f . '%';
-            }
-            if ($brand_only) {
-                $where[] = "LOWER(my_brand_mentioned) = 'yes'";
-            }
+            if ($prompt_f)   { $where[] = "prompt LIKE :prompt";             $params[':prompt']    = '%' . $prompt_f . '%'; }
+            if ($domain_f)   { $where[] = "domain LIKE :domain";             $params[':domain']    = '%' . $domain_f . '%'; }
+            if ($service_f)  { $where[] = "service = :service";              $params[':service']   = $service_f; }
+            if ($date_from)  { $where[] = "date >= :date_from";              $params[':date_from'] = $date_from; }
+            if ($date_to)    { $where[] = "date <= :date_to";                $params[':date_to']   = $date_to;   }
+            if ($brand_only) { $where[] = "LOWER(my_brand_mentioned) = 'yes'"; }
+            if ($max_pos > 0){ $where[] = "position <= :max_pos";            $params[':max_pos']   = $max_pos;   }
 
             $where_sql = $where ? 'WHERE ' . implode(' AND ', $where) : '';
 
-            // Total count
             $count_stmt = $db->prepare("SELECT COUNT(*) FROM citations $where_sql");
             $count_stmt->execute($params);
             $total = (int)$count_stmt->fetchColumn();
 
-            // Rows
             $params[':limit']  = $limit;
             $params[':offset'] = $offset;
-            $stmt = $db->prepare("SELECT title, url, domain, domain_category,
-                                         my_brand_mentioned, competitors_mentioned, cited
-                                  FROM   citations $where_sql
-                                  ORDER  BY cited DESC
-                                  LIMIT  :limit OFFSET :offset");
+            $stmt = $db->prepare("
+                SELECT   prompt, country, service, title, url, position, date,
+                         domain, domain_category, my_brand_mentioned, competitors_mentioned
+                FROM     citations $where_sql
+                ORDER BY date DESC, position ASC
+                LIMIT    :limit OFFSET :offset
+            ");
             $stmt->execute($params);
             $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
             return json_encode(['total_matched' => $total, 'offset' => $offset, 'limit' => $limit, 'rows' => $rows], JSON_PRETTY_PRINT);
+        }
+
+        // ── citations_over_time — SQLite ──────────────────────────────────────
+        case 'citations_over_time': {
+            $service_f      = strtolower(trim($args['service']   ?? ''));
+            $date_from      = trim($args['date_from']  ?? '');
+            $date_to        = trim($args['date_to']    ?? '');
+            $brand_only     = !empty($args['brand_mentioned']);
+            $group_service  = !empty($args['group_by_service']);
+
+            $db     = get_citations_db($u_id);
+            $where  = [];
+            $params = [];
+
+            if ($service_f)  { $where[] = "service = :service";              $params[':service']   = $service_f; }
+            if ($date_from)  { $where[] = "date >= :date_from";              $params[':date_from'] = $date_from; }
+            if ($date_to)    { $where[] = "date <= :date_to";                $params[':date_to']   = $date_to;   }
+            if ($brand_only) { $where[] = "LOWER(my_brand_mentioned) = 'yes'"; }
+
+            $where_sql  = $where ? 'WHERE ' . implode(' AND ', $where) : '';
+            $group_cols = $group_service ? 'date, service' : 'date';
+            $select_svc = $group_service ? ", service" : "";
+
+            $stmt = $db->prepare("
+                SELECT   date $select_svc,
+                         COUNT(*)               AS citations,
+                         COUNT(DISTINCT domain) AS unique_domains,
+                         ROUND(AVG(position),1) AS avg_position
+                FROM     citations $where_sql
+                GROUP BY $group_cols
+                ORDER BY date ASC" . ($group_service ? ", service ASC" : "")
+            );
+            $stmt->execute($params);
+            $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            // Add a summary
+            $total = array_sum(array_column($rows, 'citations'));
+            return json_encode([
+                'total_citations' => $total,
+                'days'            => count(array_unique(array_column($rows, 'date'))),
+                'group_by_service'=> $group_service,
+                'data'            => $rows,
+            ], JSON_PRETTY_PRINT);
+        }
+
+        // ── citations_by_prompt — SQLite ──────────────────────────────────────
+        case 'citations_by_prompt': {
+            $service_f  = strtolower(trim($args['service']   ?? ''));
+            $date_from  = trim($args['date_from']  ?? '');
+            $date_to    = trim($args['date_to']    ?? '');
+            $brand_only = !empty($args['brand_mentioned']);
+            $limit      = min((int)($args['limit'] ?? 20), 100);
+
+            $db     = get_citations_db($u_id);
+            $where  = [];
+            $params = [];
+
+            if ($service_f)  { $where[] = "service = :service";              $params[':service']   = $service_f; }
+            if ($date_from)  { $where[] = "date >= :date_from";              $params[':date_from'] = $date_from; }
+            if ($date_to)    { $where[] = "date <= :date_to";                $params[':date_to']   = $date_to;   }
+            if ($brand_only) { $where[] = "LOWER(my_brand_mentioned) = 'yes'"; }
+
+            $where_sql = $where ? 'WHERE ' . implode(' AND ', $where) : '';
+            $params[':limit'] = $limit;
+
+            $stmt = $db->prepare("
+                SELECT   prompt,
+                         COUNT(*)                     AS total_citations,
+                         COUNT(DISTINCT service)       AS services,
+                         COUNT(DISTINCT domain)        AS unique_domains,
+                         ROUND(AVG(position), 1)       AS avg_position,
+                         MIN(position)                 AS best_position,
+                         MIN(date)                     AS first_seen,
+                         MAX(date)                     AS last_seen
+                FROM     citations $where_sql
+                GROUP BY prompt
+                ORDER BY total_citations DESC
+                LIMIT    :limit
+            ");
+            $stmt->execute($params);
+            return json_encode($stmt->fetchAll(PDO::FETCH_ASSOC), JSON_PRETTY_PRINT);
         }
 
         // ── competitor_mentions ───────────────────────────────────────────────
