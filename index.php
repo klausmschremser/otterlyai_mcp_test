@@ -24,12 +24,6 @@
  *   https://yoursite.com/mcp.php?u_id=1234&rebuild_db=1
  */
 
-header("Expires: Tue, 01 Jan 2000 00:00:00 GMT");
-header("Last-Modified: " . gmdate("D, d M Y H:i:s") . " GMT");
-header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
-header("Cache-Control: post-check=0, pre-check=0", false);
-header("Pragma: no-cache");
-
 ini_set('memory_limit',       '256M');
 ini_set('max_execution_time', '300');
 
@@ -37,7 +31,6 @@ ini_set('max_execution_time', '300');
 // so __DIR__ = /app  ->  data folder = /app/data
 // Adjust DATA_DIR here if your layout differs.
 define('DATA_DIR', __DIR__ . '/data');
-//define('DATA_DIR', __DIR__ . '/app/../../data/');
 
 define('ENGINE_FILES', [
     'chatgpt'      => 'ChatGPT',
@@ -303,7 +296,13 @@ function get_citations_db(string $u_id): PDO {
 // ── Tools list ────────────────────────────────────────────────────────────────
 
 function get_tools(): array {
+    // NOTE: the trigger description below tells Claude when to use this MCP
     return [
+        [
+            'name'        => '_about',
+            'description' => 'IMPORTANT: Only use this MCP connector and its tools when the user explicitly asks about OtterlyAI data, mentions "OtterlyAI", asks about "my AI visibility", "my brand mentions in AI", "AI engine stats", "prompt tracking", or says "from OtterlyAI". Do NOT use these tools for general questions. This server provides access to OtterlyAI prompt tracking and citation data.',
+            'inputSchema' => ['type' => 'object', 'properties' => new stdClass, 'required' => []],
+        ],
         [
             'name'        => 'get_dataset_info',
             'description' => 'Returns info about this OtterlyAI dataset: which engine files exist, row counts per engine, and citations row count. Also shows whether the citations SQLite DB has been built.',
@@ -588,6 +587,12 @@ function execute_tool(string $name, array $args, string $u_id): string {
             return json_encode(['engine_filter' => $engine_f ?: 'all', 'competitors' => $list], JSON_PRETTY_PRINT);
         }
 
+        case '_about':
+            return json_encode([
+                'description' => 'OtterlyAI MCP server. Use only when the user asks about OtterlyAI data, brand mentions in AI engines, prompt tracking, or citations.',
+                'trigger_phrases' => ['OtterlyAI', 'AI visibility', 'brand mentions in AI', 'prompt tracking', 'citations data', 'AI engine stats'],
+            ], JSON_PRETTY_PRINT);
+
         default:
             return json_encode(['error' => "Unknown tool: $name"]);
     }
@@ -657,10 +662,10 @@ function handle_jsonrpc(array $req, string $u_id): ?array {
 
 $u_id = safe_id($_GET['u_id'] ?? '');
 if ($u_id === '') {
-    err_exit(400, 'Missing ?u_id= parameter. Usage: mcp.php?u_id=1234');
+    err_exit(400, 'Missing ?u_id= parameter. Usage: /?u_id=1234');
 }
 if (!is_dir(DATA_DIR . '/' . $u_id)) {
-    err_exit(404, "No data directory found for u_id=$u_id  (expected: " . DATA_DIR . "/$u_id/)");
+    err_exit(404, "No data directory found for u_id=$u_id (expected: " . DATA_DIR . "/$u_id/) [__DIR__=" . __DIR__ . "]");
 }
 
 // ── Debug endpoint ────────────────────────────────────────────────────────────
